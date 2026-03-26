@@ -21,6 +21,7 @@ This script automates it entirely. Select your layer (or artboards), run the scr
 ## Features
 
 - ✅ **Two modes** — single layer or multi-artboard selection, auto-detected
+- ✅ **Three copy scopes** — this document, all open documents, or an entire folder of PSDs
 - ✅ **Pixel-perfect placement** — position is preserved relative to each artboard's origin
 - ✅ **Live preview dialog** — see exactly what will be copied before committing
 - ✅ **Graceful skipping** — warns you if a layer isn't found in a selected artboard instead of erroring out
@@ -43,7 +44,7 @@ This script automates it entirely. Select your layer (or artboards), run the scr
 
 ### Mode 1 — Single Layer (Quick Copy)
 
-Best for: copying one already-placed layer to all same-size artboards.
+Best for: copying one already-placed layer to all same-size artboards in the current document.
 
 1. In the **Layers panel**, select the layer you want to copy
 2. Run the script via **File → Scripts → Browse**
@@ -55,18 +56,25 @@ Best for: copying one already-placed layer to all same-size artboards.
 
 ### Mode 2 — Multiple Artboards (Multi-Size Batch Copy)
 
-Best for: you've placed and scaled an asset correctly on one artboard per size, and want to push all of them out at once.
+Best for: you've placed and scaled an asset correctly on one artboard per size, and want to push all of them out at once — within the current document, across other open documents, or across a whole folder of PSD files.
 
 1. Manually place and scale your asset on **one artboard of each size** — get it looking exactly right
 2. In the **Layers panel**, select all of those source artboards (one per size)
-3. Run the script — a dialog appears
+3. Run the script — a **scope dialog** appears first
 
-**The dialog:**
+**Step 1 — Choose where to copy:**
+
+| Option | Behavior |
+|---|---|
+| **This document only** | Copies into matching-size artboards in the current document (original behavior) |
+| **All open documents** | Copies into every other currently-open Photoshop document |
+| **All files in a folder…** | Opens a folder picker, then processes every `.psd`/`.psb` file in that folder — copies in, saves, and closes each one automatically |
+
+**Step 2 — Choose which layer to copy:**
 
 - **Layer dropdown** — lists every layer name found across your selected artboards
-- **Live preview** — shows which artboards will receive copies and how many, updates as you change the selection
+- **Live preview** — shows which artboards will receive copies and how many (current document), or the document/file count (other scopes); updates as you change the selection
 - Warns you if the chosen layer isn't found in one of the selected artboards
-- Shows a total copy count before you run
 
 4. Pick the layer, review the preview, click **Run**
 
@@ -87,7 +95,9 @@ Document structure:
 └── Set C — 160×600    ← will receive copy
 ```
 
-Select `Set A — 300×600`, `Set A — 728×90`, `Set A — 160×600` in the Layers panel → run script → pick "Logo" → 6 copies made instantly.
+Select `Set A — 300×600`, `Set A — 728×90`, `Set A — 160×600` in the Layers panel → run script → pick scope → pick "Logo" → done.
+
+**With folder scope:** point the script at a folder of PSD files that all share the same artboard size structure. Each file is opened, the layer is copied into every matching artboard, and the file is saved and closed — no manual intervention required.
 
 ---
 
@@ -96,8 +106,10 @@ Select `Set A — 300×600`, `Set A — 728×90`, `Set A — 160×600` in the La
 | Scenario | Behavior |
 |---|---|
 | Layer name not found in a selected artboard | Skipped, reported in completion alert |
-| No matching-size artboards exist | Alert with no changes made |
+| No matching-size artboards exist in a target | No copies made for that target, no error |
 | Source artboard is also a matching size | Skipped (won't duplicate onto itself) |
+| Source document is inside the selected folder | Skipped automatically |
+| A folder file can't be opened or saved | Skipped, filename listed in completion alert |
 | Layer is a group/folder | Entire group is duplicated |
 | Scaling across different artboard sizes | Not supported — use Mode 2 to place manually per size |
 
@@ -109,6 +121,10 @@ This script intentionally does **not** auto-scale layers across different artboa
 
 Photoshop does not scale layer effects (strokes, shadows, glows) or font sizes when transforming via script. If you plan to scale assets manually before running Mode 2, convert layers to **Smart Objects** first to avoid quality loss.
 
+### Folder mode
+
+Files are saved in place (overwriting the originals). Make sure you have backups or are working on copies if you're unsure. The script skips the source document automatically if it lives in the selected folder.
+
 ---
 
 ## Compatibility
@@ -117,7 +133,7 @@ Photoshop does not scale layer effects (strokes, shadows, glows) or font sizes w
 |---|---|
 | **Photoshop version** | CC 2015 and later (artboard support required) |
 | **Platform** | macOS & Windows |
-| **File type** | Works on any `.psd` with artboards |
+| **File type** | Works on any `.psd` / `.psb` with artboards |
 
 ---
 

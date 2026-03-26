@@ -1,6 +1,6 @@
 // Copy Layer to Matching Artboards - Enhanced
 // - Single layer selected: copies to all same-size artboards (original behavior)
-// - Multiple artboards selected: dialog to choose layer, copies each to matching-size artboards
+// - Multiple artboards selected: scope dialog (this doc / open docs / folder), then layer picker
 
 (function () {
   var doc = app.activeDocument;
@@ -124,12 +124,110 @@
 
   // ─── Get All Artboards in Document ───────────────────────────────────────
 
-  function getAllArtboards() {
+  function getAllArtboards(targetDoc) {
+    var d = targetDoc || doc;
     var result = [];
-    for (var i = 0; i < doc.layers.length; i++) {
-      if (isArtboard(doc.layers[i])) result.push(doc.layers[i]);
+    for (var i = 0; i < d.layers.length; i++) {
+      if (isArtboard(d.layers[i])) result.push(d.layers[i]);
     }
     return result;
+  }
+
+  // ─── Cross-Document Copy ──────────────────────────────────────────────────
+
+  function copyLayerToDocumentArtboards(sourceLayer, sourceArtboard, targetDoc) {
+    // Read source info while source document is active
+    app.activeDocument = doc;
+    var sourceRect = getArtboardRect(sourceArtboard);
+    if (!sourceRect) return 0;
+    var size      = artboardSize(sourceRect);
+    var srcBounds = sourceLayer.bounds;
+    var relX      = srcBounds[0].value - sourceRect.left;
+    var relY      = srcBounds[1].value - sourceRect.top;
+
+    // Read target artboards while target document is active
+    app.activeDocument = targetDoc;
+    var targetArtboards = getAllArtboards(targetDoc);
+
+    var count = 0;
+    for (var i = 0; i < targetArtboards.length; i++) {
+      // getArtboardRect uses ActionManager — target doc must be active
+      app.activeDocument = targetDoc;
+      var rect = getArtboardRect(targetArtboards[i]);
+      if (!rect) continue;
+      var s = artboardSize(rect);
+      if (s.w !== size.w || s.h !== size.h) continue;
+
+      // duplicate(layerSet) across documents silently copies to the wrong doc;
+      // instead, duplicate to the target document then move into the artboard
+      app.activeDocument = doc;
+      var duped = sourceLayer.duplicate(targetDoc);
+
+      app.activeDocument = targetDoc;
+      duped.move(targetArtboards[i], ElementPlacement.PLACEATBEGINNING);
+      var dupBounds = duped.bounds;
+      duped.translate(
+        rect.left + relX - dupBounds[0].value,
+        rect.top  + relY - dupBounds[1].value
+      );
+      count++;
+    }
+    return count;
+  }
+
+  // ─── Folder File Enumeration ──────────────────────────────────────────────
+
+  function getPSDFiles(folder) {
+    var files  = folder.getFiles();
+    var result = [];
+    for (var i = 0; i < files.length; i++) {
+      if (files[i] instanceof File) {
+        var n = files[i].name.toLowerCase();
+        if (n.match(/\.(psd|psb)$/)) result.push(files[i]);
+      }
+    }
+    return result;
+  }
+
+  // ─── Scope Dialog ─────────────────────────────────────────────────────────
+
+  function showScopeDialog() {
+    var dlg = new Window("dialog", "Copy Scope");
+    dlg.orientation  = "column";
+    dlg.alignChildren = ["fill", "top"];
+    dlg.spacing  = 10;
+    dlg.margins  = 18;
+
+    dlg.add("statictext", undefined, "Where should the layer be copied?");
+    var r1 = dlg.add("radiobutton", undefined, "This document only");
+    var r2 = dlg.add("radiobutton", undefined, "All open documents");
+    dlg.add("radiobutton", undefined, "All files in a folder\u2026");
+    r1.value = true;
+
+    var btnGroup  = dlg.add("group");
+    btnGroup.alignment = "right";
+    var cancelBtn = btnGroup.add("button", undefined, "Cancel", { name: "cancel" });
+    var nextBtn   = btnGroup.add("button", undefined, "Next",   { name: "ok" });
+
+    var result = null;
+    cancelBtn.onClick = function () { dlg.close(); };
+    nextBtn.onClick = function () {
+      if (r1.value) {
+        result = "current";
+        dlg.close();
+      } else if (r2.value) {
+        result = "open";
+        dlg.close();
+      } else {
+        var folder = Folder.selectDialog("Choose a folder of PSD files");
+        if (!folder) return; // user cancelled folder picker — keep dialog open
+        result = folder;
+        dlg.close();
+      }
+    };
+
+    dlg.show();
+    return result; // null if cancelled via Cancel button
   }
 
   // ─── Get Selected Layers via Action Manager ───────────────────────────────
@@ -162,7 +260,7 @@
 
   // ─── Dialog: Multi-Artboard Mode ─────────────────────────────────────────
 
-  function showMultiArtboardDialog(selectedArtboards, allArtboards) {
+  function showMultiArtboardDialog(selectedArtboards, allArtboards, scope) {
     // Collect all layer names across selected artboards
     var namesMap = {};
     for (var i = 0; i < selectedArtboards.length; i++) {
@@ -183,32 +281,59 @@
     // Build preview data
     function buildPreview(layerName) {
       var lines = [];
-      var totalCopies = 0;
-      for (var i = 0; i < selectedArtboards.length; i++) {
-        var ab   = selectedArtboards[i];
-        var rect = getArtboardRect(ab);
-        if (!rect) continue;
 
-        var layer = findLayerRecursive(ab, layerName);
-        if (!layer) {
-          lines.push("  \u26A0 \"" + ab.name + "\" \u2014 layer not found, will skip");
-          continue;
-        }
+      if (scope === "current") {
+        // ── This document: show per-artboard breakdown ──
+        var totalCopies = 0;
+        for (var i = 0; i < selectedArtboards.length; i++) {
+          var ab   = selectedArtboards[i];
+          var rect = getArtboardRect(ab);
+          if (!rect) continue;
 
-        var size    = artboardSize(rect);
-        var matches = 0;
-        for (var j = 0; j < allArtboards.length; j++) {
-          if (allArtboards[j].id === ab.id) continue;
-          var r2 = getArtboardRect(allArtboards[j]);
-          if (!r2) continue;
-          var s2 = artboardSize(r2);
-          if (s2.w === size.w && s2.h === size.h) matches++;
+          var layer = findLayerRecursive(ab, layerName);
+          if (!layer) {
+            lines.push("  \u26A0 \"" + ab.name + "\" \u2014 layer not found, will skip");
+            continue;
+          }
+
+          var size    = artboardSize(rect);
+          var matches = 0;
+          for (var j = 0; j < allArtboards.length; j++) {
+            if (allArtboards[j].id === ab.id) continue;
+            var r2 = getArtboardRect(allArtboards[j]);
+            if (!r2) continue;
+            var s2 = artboardSize(r2);
+            if (s2.w === size.w && s2.h === size.h) matches++;
+          }
+          totalCopies += matches;
+          lines.push("  \u2022 \"" + ab.name + "\" (" + size.w + "\xD7" + size.h + ") \u2192 " + matches + " other artboard" + (matches !== 1 ? "s" : ""));
         }
-        totalCopies += matches;
-        lines.push("  \u2022 \"" + ab.name + "\" (" + size.w + "\xD7" + size.h + ") \u2192 " + matches + " other artboard" + (matches !== 1 ? "s" : ""));
+        lines.push("");
+        lines.push("Total copies to be made: " + totalCopies);
+
+      } else if (scope === "open") {
+        // ── All open documents ──
+        var otherDocs = 0;
+        for (var d = 0; d < app.documents.length; d++) {
+          if (app.documents[d].id !== doc.id) otherDocs++;
+        }
+        lines.push("Scope: all open documents");
+        lines.push("Other open documents: " + otherDocs);
+        lines.push("");
+        lines.push("Layer \"" + layerName + "\" will be copied into");
+        lines.push("matching-size artboards in each document.");
+
+      } else {
+        // ── Folder ──
+        var psdFiles = getPSDFiles(scope);
+        lines.push("Scope: folder  \u2014  " + scope.name);
+        lines.push("PSD/PSB files found: " + psdFiles.length);
+        lines.push("");
+        lines.push("Layer \"" + layerName + "\" will be copied into");
+        lines.push("matching-size artboards in each file.");
+        lines.push("Files will be saved automatically.");
       }
-      lines.push("");
-      lines.push("Total copies to be made: " + totalCopies);
+
       return lines.join("\n");
     }
 
@@ -259,20 +384,83 @@
       var totalCount = 0;
       var skipped    = 0;
 
-      for (var i = 0; i < selectedArtboards.length; i++) {
-        var ab    = selectedArtboards[i];
-        var layer = findLayerRecursive(ab, layerName);
-        if (!layer) { skipped++; continue; }
+      if (scope === "current") {
+        // ── This document ──
+        for (var i = 0; i < selectedArtboards.length; i++) {
+          var ab    = selectedArtboards[i];
+          var layer = findLayerRecursive(ab, layerName);
+          if (!layer) { skipped++; continue; }
+          var result = copyLayerToMatchingArtboards(layer, ab, allArtboards);
+          totalCount += result.count;
+        }
+        dlg.close();
+        var msg = "Done! Copied \"" + layerName + "\" to " + totalCount + " artboard" + (totalCount !== 1 ? "s" : "") + ".";
+        if (skipped > 0) msg += "\n(" + skipped + " artboard" + (skipped !== 1 ? "s" : "") + " did not contain that layer and were skipped.)";
+        alert(msg);
 
-        var result = copyLayerToMatchingArtboards(layer, ab, allArtboards);
-        totalCount += result.count;
+      } else if (scope === "open") {
+        // ── All open documents ──
+        var docErrors = 0;
+        for (var d = 0; d < app.documents.length; d++) {
+          var targetDoc = app.documents[d];
+          if (targetDoc.id === doc.id) continue;
+          for (var i = 0; i < selectedArtboards.length; i++) {
+            var ab    = selectedArtboards[i];
+            var layer = findLayerRecursive(ab, layerName);
+            if (!layer) { skipped++; continue; }
+            try {
+              totalCount += copyLayerToDocumentArtboards(layer, ab, targetDoc);
+            } catch (e) { docErrors++; }
+          }
+        }
+        dlg.close();
+        var msg = "Done! Copied \"" + layerName + "\" to " + totalCount + " artboard" + (totalCount !== 1 ? "s" : "") + " across open documents.";
+        if (skipped > 0) msg += "\n(" + skipped + " artboard" + (skipped !== 1 ? "s" : "") + " skipped \u2014 layer not found.)";
+        if (docErrors > 0) msg += "\n(" + docErrors + " error" + (docErrors !== 1 ? "s" : "") + " encountered.)";
+        alert(msg);
+
+      } else {
+        // ── Folder ──
+        var psdFiles   = getPSDFiles(scope);
+        var filesDone  = 0;
+        var failedNames = [];
+        if (psdFiles.length === 0) {
+          dlg.close();
+          alert("No PSD or PSB files found in the selected folder.");
+          return;
+        }
+        var sourceFilePath = (doc.fullName) ? doc.fullName.fsName : null;
+        var prevDialogs = app.displayDialogs;
+        app.displayDialogs = DialogModes.NO;
+        for (var f = 0; f < psdFiles.length; f++) {
+          // Skip the source document itself
+          if (sourceFilePath && psdFiles[f].fsName === sourceFilePath) continue;
+          var targetDoc = null;
+          try {
+            targetDoc = app.open(psdFiles[f]);
+            for (var i = 0; i < selectedArtboards.length; i++) {
+              var ab    = selectedArtboards[i];
+              var layer = findLayerRecursive(ab, layerName);
+              if (!layer) { skipped++; continue; }
+              totalCount += copyLayerToDocumentArtboards(layer, ab, targetDoc);
+            }
+            targetDoc.close(SaveOptions.SAVECHANGES);
+            filesDone++;
+          } catch (e) {
+            failedNames.push(psdFiles[f].name + " (" + e.message + ")");
+            if (targetDoc) {
+              try { targetDoc.close(SaveOptions.DONOTSAVECHANGES); } catch (e2) {}
+            }
+          }
+        }
+        app.displayDialogs = prevDialogs;
+        dlg.close();
+        var msg = "Done! Processed " + filesDone + " of " + psdFiles.length + " file" + (psdFiles.length !== 1 ? "s" : "") + ".";
+        msg += "\nCopied \"" + layerName + "\" to " + totalCount + " artboard" + (totalCount !== 1 ? "s" : "") + " total.";
+        if (skipped > 0) msg += "\n(" + skipped + " artboard" + (skipped !== 1 ? "s" : "") + " skipped \u2014 layer not found.)";
+        if (failedNames.length > 0) msg += "\n\nFailed files:\n" + failedNames.join("\n");
+        alert(msg);
       }
-
-      dlg.close();
-
-      var msg = "Done! Copied \"" + layerName + "\" to " + totalCount + " artboard" + (totalCount !== 1 ? "s" : "") + ".";
-      if (skipped > 0) msg += "\n(" + skipped + " selected artboard" + (skipped !== 1 ? "s" : "") + " did not contain that layer and were skipped.)";
-      alert(msg);
     };
 
     dlg.show();
@@ -306,6 +494,9 @@
   }
 
   // ── Mode B: Artboards selected ──
-  showMultiArtboardDialog(selectedArtboards, allArtboards);
+  var scope = showScopeDialog();
+  if (scope !== null) {
+    showMultiArtboardDialog(selectedArtboards, allArtboards, scope);
+  }
 
 })();
