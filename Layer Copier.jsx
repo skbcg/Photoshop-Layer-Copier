@@ -135,44 +135,93 @@
 
   // ─── Cross-Document Copy ──────────────────────────────────────────────────
 
-  function copyLayerToDocumentArtboards(sourceLayer, sourceArtboard, targetDoc) {
-    // Read source info while source document is active
-    app.activeDocument = doc;
-    var sourceRect = getArtboardRect(sourceArtboard);
-    if (!sourceRect) return 0;
-    var size      = artboardSize(sourceRect);
-    var srcBounds = sourceLayer.bounds;
-    var relX      = srcBounds[0].value - sourceRect.left;
-    var relY      = srcBounds[1].value - sourceRect.top;
-
-    // Read target artboards while target document is active
+  // Copies the named layer from every selected source artboard into matching-size
+  // artboards in targetDoc. All copies share ONE embedded smart object (the first
+  // cross-doc duplicate), then every additional placement is a within-doc duplicate
+  // so they remain linked to each other inside the target document.
+  function copyLayersToDocument(selectedArtboards, layerName, targetDoc) {
+    // Gather all target artboards while targetDoc is active
     app.activeDocument = targetDoc;
     var targetArtboards = getAllArtboards(targetDoc);
 
-    var count = 0;
-    for (var i = 0; i < targetArtboards.length; i++) {
-      // getArtboardRect uses ActionManager — target doc must be active
-      app.activeDocument = targetDoc;
-      var rect = getArtboardRect(targetArtboards[i]);
-      if (!rect) continue;
-      var s = artboardSize(rect);
-      if (s.w !== size.w || s.h !== size.h) continue;
+    // Build the full list of (sourceLayer, targetArtboard, relX, relY) placements
+    var placements = [];
+    var skipped    = 0;
 
-      // duplicate(layerSet) across documents silently copies to the wrong doc;
-      // instead, duplicate to the target document then move into the artboard
+    for (var i = 0; i < selectedArtboards.length; i++) {
       app.activeDocument = doc;
-      var duped = sourceLayer.duplicate(targetDoc);
+      var ab    = selectedArtboards[i];
+      var layer = findLayerRecursive(ab, layerName);
+      if (!layer) { skipped++; continue; }
+
+      var sourceRect = getArtboardRect(ab);
+      if (!sourceRect) continue;
+      var size      = artboardSize(sourceRect);
+      var srcBounds = layer.bounds;
+      var relX      = srcBounds[0].value - sourceRect.left;
+      var relY      = srcBounds[1].value - sourceRect.top;
+
+      var srcW = srcBounds[2].value - srcBounds[0].value;
+      var srcH = srcBounds[3].value - srcBounds[1].value;
 
       app.activeDocument = targetDoc;
-      duped.move(targetArtboards[i], ElementPlacement.PLACEATBEGINNING);
-      var dupBounds = duped.bounds;
-      duped.translate(
-        rect.left + relX - dupBounds[0].value,
-        rect.top  + relY - dupBounds[1].value
-      );
-      count++;
+      for (var k = 0; k < targetArtboards.length; k++) {
+        var rect = getArtboardRect(targetArtboards[k]);
+        if (!rect) continue;
+        var s = artboardSize(rect);
+        if (s.w === size.w && s.h === size.h) {
+          placements.push({ sourceLayer: layer, targetArtboard: targetArtboards[k], rect: rect, relX: relX, relY: relY, srcWidth: srcW, srcHeight: srcH });
+        }
+      }
     }
-    return count;
+
+    if (placements.length === 0) return { count: 0, skipped: skipped };
+
+    // Cross-doc duplicate ONCE — establishes a new embedded SO in targetDoc
+    app.activeDocument = doc;
+    var baseLayer = placements[0].sourceLayer.duplicate(targetDoc);
+
+    // Place the base layer in the first target artboard
+    app.activeDocument = targetDoc;
+    baseLayer.move(placements[0].targetArtboard, ElementPlacement.PLACEATBEGINNING);
+    var bb = baseLayer.bounds;
+    var baseW = bb[2].value - bb[0].value;
+    var baseH = bb[3].value - bb[1].value;
+    baseLayer.translate(
+      placements[0].rect.left + placements[0].relX - bb[0].value,
+      placements[0].rect.top  + placements[0].relY - bb[1].value
+    );
+    // Correct for any resolution-caused scale change on the cross-doc duplicate
+    if (baseW > 0 && baseH > 0) {
+      baseLayer.resize(
+        (placements[0].srcWidth  / baseW) * 100,
+        (placements[0].srcHeight / baseH) * 100,
+        AnchorPosition.TOPLEFT
+      );
+    }
+
+    // Every subsequent placement duplicates from baseLayer within targetDoc — linked copy.
+    // Each copy is then resized to match its own source layer's dimensions, so different
+    // artboard sizes get the correct scale while still sharing one embedded smart object.
+    for (var p = 1; p < placements.length; p++) {
+      app.activeDocument = targetDoc;
+      var duped = baseLayer.duplicate(placements[p].targetArtboard, ElementPlacement.PLACEATBEGINNING);
+      var db = duped.bounds;
+      duped.translate(
+        placements[p].rect.left + placements[p].relX - db[0].value,
+        placements[p].rect.top  + placements[p].relY - db[1].value
+      );
+      // Resize from baseLayer's source dimensions to this placement's source dimensions
+      if (placements[0].srcWidth > 0 && placements[0].srcHeight > 0) {
+        duped.resize(
+          (placements[p].srcWidth  / placements[0].srcWidth)  * 100,
+          (placements[p].srcHeight / placements[0].srcHeight) * 100,
+          AnchorPosition.TOPLEFT
+        );
+      }
+    }
+
+    return { count: placements.length, skipped: skipped };
   }
 
   // ─── Folder File Enumeration ──────────────────────────────────────────────
@@ -404,14 +453,11 @@
         for (var d = 0; d < app.documents.length; d++) {
           var targetDoc = app.documents[d];
           if (targetDoc.id === doc.id) continue;
-          for (var i = 0; i < selectedArtboards.length; i++) {
-            var ab    = selectedArtboards[i];
-            var layer = findLayerRecursive(ab, layerName);
-            if (!layer) { skipped++; continue; }
-            try {
-              totalCount += copyLayerToDocumentArtboards(layer, ab, targetDoc);
-            } catch (e) { docErrors++; }
-          }
+          try {
+            var r = copyLayersToDocument(selectedArtboards, layerName, targetDoc);
+            totalCount += r.count;
+            skipped    += r.skipped;
+          } catch (e) { docErrors++; }
         }
         dlg.close();
         var msg = "Done! Copied \"" + layerName + "\" to " + totalCount + " artboard" + (totalCount !== 1 ? "s" : "") + " across open documents.";
@@ -438,12 +484,9 @@
           var targetDoc = null;
           try {
             targetDoc = app.open(psdFiles[f]);
-            for (var i = 0; i < selectedArtboards.length; i++) {
-              var ab    = selectedArtboards[i];
-              var layer = findLayerRecursive(ab, layerName);
-              if (!layer) { skipped++; continue; }
-              totalCount += copyLayerToDocumentArtboards(layer, ab, targetDoc);
-            }
+            var r = copyLayersToDocument(selectedArtboards, layerName, targetDoc);
+            totalCount += r.count;
+            skipped    += r.skipped;
             targetDoc.close(SaveOptions.SAVECHANGES);
             filesDone++;
           } catch (e) {
