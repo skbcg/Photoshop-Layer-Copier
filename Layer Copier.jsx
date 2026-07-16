@@ -18,6 +18,13 @@
     }
   }
 
+  function getLayerTransformBounds(layer) {
+    try {
+      if (layer.boundsNoEffects) return layer.boundsNoEffects;
+    } catch (e) {}
+    return layer.bounds;
+  }
+
   function getArtboardRect(layer) {
     try {
       var ref = new ActionReference();
@@ -54,6 +61,30 @@
       parent = parent.parent;
     }
     return null;
+  }
+
+  function selectLayerById(layerId) {
+    var ref = new ActionReference();
+    ref.putIdentifier(charIDToTypeID("Lyr "), layerId);
+    var desc = new ActionDescriptor();
+    desc.putReference(charIDToTypeID("null"), ref);
+    desc.putBoolean(charIDToTypeID("MkVs"), false);
+    executeAction(charIDToTypeID("slct"), desc, DialogModes.NO);
+  }
+
+  function copyLayerEffectsBetweenDocuments(sourceLayer, targetLayer, targetDoc) {
+    try {
+      app.activeDocument = doc;
+      selectLayerById(sourceLayer.id);
+      executeAction(stringIDToTypeID("copyEffects"), new ActionDescriptor(), DialogModes.NO);
+
+      app.activeDocument = targetDoc;
+      selectLayerById(targetLayer.id);
+      executeAction(stringIDToTypeID("pasteEffects"), new ActionDescriptor(), DialogModes.NO);
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   // Find a direct child layer by name inside a LayerSet
@@ -93,7 +124,7 @@
     if (!sourceRect) return { count: 0, error: "Could not read source artboard rect." };
 
     var size      = artboardSize(sourceRect);
-    var srcBounds = sourceLayer.bounds;
+    var srcBounds = getLayerTransformBounds(sourceLayer);
     var relX      = srcBounds[0].value - sourceRect.left;
     var relY      = srcBounds[1].value - sourceRect.top;
 
@@ -109,7 +140,7 @@
       if (abSize.w !== size.w || abSize.h !== size.h) continue;
 
       var duped      = sourceLayer.duplicate(ab, ElementPlacement.PLACEATBEGINNING);
-      var dupBounds  = duped.bounds;
+      var dupBounds  = getLayerTransformBounds(duped);
       var targetLeft = rect.left + relX;
       var targetTop  = rect.top  + relY;
 
@@ -144,9 +175,11 @@
     app.activeDocument = targetDoc;
     var targetArtboards = getAllArtboards(targetDoc);
 
-    // Build the full list of (sourceLayer, targetArtboard, relX, relY) placements
-    var placements = [];
-    var skipped    = 0;
+    // Build source candidates first; then map exactly one candidate per target artboard.
+    // This avoids duplicate copies when multiple selected source artboards share a size.
+    var sourceCandidates = [];
+    var placements       = [];
+    var skipped          = 0;
 
     for (var i = 0; i < selectedArtboards.length; i++) {
       app.activeDocument = doc;
@@ -157,22 +190,57 @@
       var sourceRect = getArtboardRect(ab);
       if (!sourceRect) continue;
       var size      = artboardSize(sourceRect);
-      var srcBounds = layer.bounds;
+      var srcBounds = getLayerTransformBounds(layer);
       var relX      = srcBounds[0].value - sourceRect.left;
       var relY      = srcBounds[1].value - sourceRect.top;
 
       var srcW = srcBounds[2].value - srcBounds[0].value;
       var srcH = srcBounds[3].value - srcBounds[1].value;
 
-      app.activeDocument = targetDoc;
-      for (var k = 0; k < targetArtboards.length; k++) {
-        var rect = getArtboardRect(targetArtboards[k]);
-        if (!rect) continue;
-        var s = artboardSize(rect);
-        if (s.w === size.w && s.h === size.h) {
-          placements.push({ sourceLayer: layer, targetArtboard: targetArtboards[k], rect: rect, relX: relX, relY: relY, srcWidth: srcW, srcHeight: srcH });
+      sourceCandidates.push({
+        sourceLayer: layer,
+        sourceArtboardName: ab.name,
+        sizeKey: sizeKey(size.w, size.h),
+        relX: relX,
+        relY: relY,
+        srcWidth: srcW,
+        srcHeight: srcH
+      });
+    }
+
+    app.activeDocument = targetDoc;
+    for (var k = 0; k < targetArtboards.length; k++) {
+      var targetAb = targetArtboards[k];
+      var rect = getArtboardRect(targetAb);
+      if (!rect) continue;
+
+      var targetSize = artboardSize(rect);
+      var targetKey = sizeKey(targetSize.w, targetSize.h);
+
+      var candidates = [];
+      for (var c = 0; c < sourceCandidates.length; c++) {
+        if (sourceCandidates[c].sizeKey === targetKey) candidates.push(sourceCandidates[c]);
+      }
+      if (candidates.length === 0) continue;
+
+      // Prefer the source artboard with the same name as the target artboard.
+      var chosen = candidates[0];
+      for (var m = 0; m < candidates.length; m++) {
+        if (candidates[m].sourceArtboardName === targetAb.name) {
+          chosen = candidates[m];
+          break;
         }
       }
+
+      placements.push({
+        sourceLayer: chosen.sourceLayer,
+        targetArtboard: targetAb,
+        rect: rect,
+        relX: chosen.relX,
+        relY: chosen.relY,
+        srcWidth: chosen.srcWidth,
+        srcHeight: chosen.srcHeight
+      });
     }
 
     if (placements.length === 0) return { count: 0, skipped: skipped };
@@ -184,7 +252,7 @@
     // Place the base layer in the first target artboard
     app.activeDocument = targetDoc;
     baseLayer.move(placements[0].targetArtboard, ElementPlacement.PLACEATBEGINNING);
-    var bb = baseLayer.bounds;
+    var bb = getLayerTransformBounds(baseLayer);
     var baseW = bb[2].value - bb[0].value;
     var baseH = bb[3].value - bb[1].value;
     baseLayer.translate(
@@ -199,6 +267,7 @@
         AnchorPosition.TOPLEFT
       );
     }
+    copyLayerEffectsBetweenDocuments(placements[0].sourceLayer, baseLayer, targetDoc);
 
     // Every subsequent placement duplicates from baseLayer within targetDoc — linked copy.
     // Each copy is then resized to match its own source layer's dimensions, so different
@@ -206,19 +275,22 @@
     for (var p = 1; p < placements.length; p++) {
       app.activeDocument = targetDoc;
       var duped = baseLayer.duplicate(placements[p].targetArtboard, ElementPlacement.PLACEATBEGINNING);
-      var db = duped.bounds;
+      var db = getLayerTransformBounds(duped);
       duped.translate(
         placements[p].rect.left + placements[p].relX - db[0].value,
         placements[p].rect.top  + placements[p].relY - db[1].value
       );
-      // Resize from baseLayer's source dimensions to this placement's source dimensions
-      if (placements[0].srcWidth > 0 && placements[0].srcHeight > 0) {
+      // Resize from the duplicate's current dimensions to this placement's source dimensions.
+      var dupW = db[2].value - db[0].value;
+      var dupH = db[3].value - db[1].value;
+      if (dupW > 0 && dupH > 0) {
         duped.resize(
-          (placements[p].srcWidth  / placements[0].srcWidth)  * 100,
-          (placements[p].srcHeight / placements[0].srcHeight) * 100,
+          (placements[p].srcWidth  / dupW) * 100,
+          (placements[p].srcHeight / dupH) * 100,
           AnchorPosition.TOPLEFT
         );
       }
+      copyLayerEffectsBetweenDocuments(placements[p].sourceLayer, duped, targetDoc);
     }
 
     return { count: placements.length, skipped: skipped };
