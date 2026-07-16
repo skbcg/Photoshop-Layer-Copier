@@ -1,6 +1,7 @@
 // Copy Layer to Matching Artboards - Enhanced
 // - Single layer selected: copies to all same-size artboards (original behavior)
-// - Multiple artboards selected: scope dialog (this doc / open docs / folder), then layer picker
+// - Multiple artboards selected: scope dialog (this doc / open docs / folder), then
+//   multi-select layer picker (dialog stays open so you can copy additional layers)
 
 (function () {
   var doc = app.activeDocument;
@@ -117,18 +118,81 @@
     return null;
   }
 
+  // If a same-named layer exists in the artboard, remove it and return where
+  // the replacement should be inserted (same parent / stack position when possible).
+  // Returns { removed: bool, container: LayerSet|Artboard, relative: Layer|null, placement: ElementPlacement }
+  function prepareReplaceSlot(artboard, layerName) {
+    var existing = findLayerRecursive(artboard, layerName);
+    if (!existing) {
+      return {
+        removed: false,
+        container: artboard,
+        relative: null,
+        placement: ElementPlacement.PLACEATBEGINNING
+      };
+    }
+
+    var parent = existing.parent;
+    var siblings = parent.layers;
+    var idx = -1;
+    for (var i = 0; i < siblings.length; i++) {
+      if (siblings[i].id === existing.id) { idx = i; break; }
+    }
+
+    // Layer below the existing one (higher index = lower in the stack)
+    var below = (idx >= 0 && idx + 1 < siblings.length) ? siblings[idx + 1] : null;
+    existing.remove();
+
+    if (below) {
+      return {
+        removed: true,
+        container: parent,
+        relative: below,
+        placement: ElementPlacement.PLACEBEFORE
+      };
+    }
+    return {
+      removed: true,
+      container: parent,
+      relative: null,
+      placement: ElementPlacement.PLACEATBEGINNING
+    };
+  }
+
+  function duplicateIntoSlot(sourceLayer, artboard, layerName, replaceExisting) {
+    if (replaceExisting) {
+      var slot = prepareReplaceSlot(artboard, layerName);
+      if (slot.relative) {
+        return {
+          layer: sourceLayer.duplicate(slot.relative, slot.placement),
+          replaced: slot.removed
+        };
+      }
+      return {
+        layer: sourceLayer.duplicate(slot.container, slot.placement),
+        replaced: slot.removed
+      };
+    }
+    return {
+      layer: sourceLayer.duplicate(artboard, ElementPlacement.PLACEATBEGINNING),
+      replaced: false
+    };
+  }
+
   // ─── Copy Logic ───────────────────────────────────────────────────────────
 
-  function copyLayerToMatchingArtboards(sourceLayer, sourceArtboard, allArtboards) {
+  function copyLayerToMatchingArtboards(sourceLayer, sourceArtboard, allArtboards, replaceExisting) {
     var sourceRect = getArtboardRect(sourceArtboard);
-    if (!sourceRect) return { count: 0, error: "Could not read source artboard rect." };
+    if (!sourceRect) return { count: 0, replaced: 0, error: "Could not read source artboard rect." };
 
     var size      = artboardSize(sourceRect);
     var srcBounds = getLayerTransformBounds(sourceLayer);
     var relX      = srcBounds[0].value - sourceRect.left;
     var relY      = srcBounds[1].value - sourceRect.top;
+    var layerName = sourceLayer.name;
 
     var count = 0;
+    var replaced = 0;
     for (var i = 0; i < allArtboards.length; i++) {
       var ab = allArtboards[i];
       if (ab.id === sourceArtboard.id) continue;
@@ -139,7 +203,9 @@
       var abSize = artboardSize(rect);
       if (abSize.w !== size.w || abSize.h !== size.h) continue;
 
-      var duped      = sourceLayer.duplicate(ab, ElementPlacement.PLACEATBEGINNING);
+      var placed     = duplicateIntoSlot(sourceLayer, ab, layerName, replaceExisting);
+      var duped      = placed.layer;
+      if (placed.replaced) replaced++;
       var dupBounds  = getLayerTransformBounds(duped);
       var targetLeft = rect.left + relX;
       var targetTop  = rect.top  + relY;
@@ -150,7 +216,7 @@
       );
       count++;
     }
-    return { count: count, error: null };
+    return { count: count, replaced: replaced, error: null };
   }
 
   // ─── Get All Artboards in Document ───────────────────────────────────────
@@ -170,7 +236,21 @@
   // artboards in targetDoc. All copies share ONE embedded smart object (the first
   // cross-doc duplicate), then every additional placement is a within-doc duplicate
   // so they remain linked to each other inside the target document.
-  function copyLayersToDocument(selectedArtboards, layerName, targetDoc) {
+  function moveIntoSlot(layer, artboard, layerName, replaceExisting) {
+    if (replaceExisting) {
+      var slot = prepareReplaceSlot(artboard, layerName);
+      if (slot.relative) {
+        layer.move(slot.relative, slot.placement);
+      } else {
+        layer.move(slot.container, slot.placement);
+      }
+      return slot.removed;
+    }
+    layer.move(artboard, ElementPlacement.PLACEATBEGINNING);
+    return false;
+  }
+
+  function copyLayersToDocument(selectedArtboards, layerName, targetDoc, replaceExisting) {
     // Gather all target artboards while targetDoc is active
     app.activeDocument = targetDoc;
     var targetArtboards = getAllArtboards(targetDoc);
@@ -180,6 +260,7 @@
     var sourceCandidates = [];
     var placements       = [];
     var skipped          = 0;
+    var replaced         = 0;
 
     for (var i = 0; i < selectedArtboards.length; i++) {
       app.activeDocument = doc;
@@ -243,15 +324,15 @@
       });
     }
 
-    if (placements.length === 0) return { count: 0, skipped: skipped };
+    if (placements.length === 0) return { count: 0, skipped: skipped, replaced: 0 };
 
     // Cross-doc duplicate ONCE — establishes a new embedded SO in targetDoc
     app.activeDocument = doc;
     var baseLayer = placements[0].sourceLayer.duplicate(targetDoc);
 
-    // Place the base layer in the first target artboard
+    // Place the base layer in the first target artboard (replace same-named layer if opted in)
     app.activeDocument = targetDoc;
-    baseLayer.move(placements[0].targetArtboard, ElementPlacement.PLACEATBEGINNING);
+    if (moveIntoSlot(baseLayer, placements[0].targetArtboard, layerName, replaceExisting)) replaced++;
     var bb = getLayerTransformBounds(baseLayer);
     var baseW = bb[2].value - bb[0].value;
     var baseH = bb[3].value - bb[1].value;
@@ -274,7 +355,15 @@
     // artboard sizes get the correct scale while still sharing one embedded smart object.
     for (var p = 1; p < placements.length; p++) {
       app.activeDocument = targetDoc;
-      var duped = baseLayer.duplicate(placements[p].targetArtboard, ElementPlacement.PLACEATBEGINNING);
+      var slot = replaceExisting
+        ? prepareReplaceSlot(placements[p].targetArtboard, layerName)
+        : { removed: false, container: placements[p].targetArtboard, relative: null, placement: ElementPlacement.PLACEATBEGINNING };
+      if (slot.removed) replaced++;
+
+      var duped = slot.relative
+        ? baseLayer.duplicate(slot.relative, slot.placement)
+        : baseLayer.duplicate(slot.container, slot.placement);
+
       var db = getLayerTransformBounds(duped);
       duped.translate(
         placements[p].rect.left + placements[p].relX - db[0].value,
@@ -293,7 +382,7 @@
       copyLayerEffectsBetweenDocuments(placements[p].sourceLayer, duped, targetDoc);
     }
 
-    return { count: placements.length, skipped: skipped };
+    return { count: placements.length, skipped: skipped, replaced: replaced };
   }
 
   // ─── Folder File Enumeration ──────────────────────────────────────────────
@@ -465,14 +554,20 @@
     dlg.spacing = 12;
     dlg.margins = 18;
 
-    // Layer selector
-    var selectorGroup = dlg.add("group");
-    selectorGroup.orientation = "row";
-    selectorGroup.alignChildren = ["left", "center"];
-    selectorGroup.add("statictext", undefined, "Layer to copy:");
-    var dropdown = selectorGroup.add("dropdownlist", undefined, namesList);
-    dropdown.selection = 0;
-    dropdown.preferredSize.width = 220;
+    // Layer selector (multi-select list — Cmd/Ctrl-click or Shift-click)
+    dlg.add("statictext", undefined, "Layers to copy: (Cmd/Ctrl or Shift-click for multiple)");
+    var layerList = dlg.add("listbox", undefined, namesList, { multiselect: true });
+    layerList.preferredSize = [360, 140];
+    if (layerList.items.length > 0) layerList.selection = 0;
+
+    // Replace option
+    var replaceCb = dlg.add(
+      "checkbox",
+      undefined,
+      "Replace existing layers with the same name"
+    );
+    replaceCb.value = false;
+    replaceCb.helpTip = "If a target artboard already has a layer with this exact name, delete it and put the new copy in its place.";
 
     // Preview panel
     var previewPanel = dlg.add("panel", undefined, "Preview");
@@ -481,101 +576,167 @@
     var previewText = previewPanel.add("statictext", undefined, "", { multiline: true });
     previewText.preferredSize = [360, 120];
 
-    function updatePreview() {
-      if (dropdown.selection) {
-        previewText.text = buildPreview(dropdown.selection.text);
+    // Status line (keeps dialog open after each run)
+    var statusText = dlg.add("statictext", undefined, "");
+    statusText.preferredSize = [360, 18];
+
+    function getSelectedLayerNames() {
+      var names = [];
+      var sel = layerList.selection;
+      if (!sel) return names;
+      // ScriptUI returns a single ListItem for one selection, an Array for multiple
+      if (sel instanceof Array) {
+        for (var i = 0; i < sel.length; i++) names.push(sel[i].text);
+      } else {
+        names.push(sel.text);
       }
+      return names;
     }
 
-    dropdown.onChange = updatePreview;
+    function updatePreview() {
+      var names = getSelectedLayerNames();
+      if (names.length === 0) {
+        previewText.text = "Select one or more layers above.";
+        return;
+      }
+      var replaceNote = replaceCb.value
+        ? "\n\nReplace ON \u2014 same-named layers in targets will be overwritten."
+        : "";
+      if (names.length === 1) {
+        previewText.text = buildPreview(names[0]) + replaceNote;
+        return;
+      }
+      // Multi-select: short summary for each selected layer
+      var lines = ["Selected " + names.length + " layers:"];
+      for (var i = 0; i < names.length; i++) {
+        lines.push("");
+        lines.push("\u2014 " + names[i] + " \u2014");
+        lines.push(buildPreview(names[i]));
+      }
+      previewText.text = lines.join("\n") + replaceNote;
+    }
+
+    layerList.onChange = updatePreview;
+    replaceCb.onClick = updatePreview;
     updatePreview();
 
     // Buttons
     var btnGroup = dlg.add("group");
     btnGroup.orientation = "row";
     btnGroup.alignment = "right";
-    var cancelBtn = btnGroup.add("button", undefined, "Cancel", { name: "cancel" });
-    var runBtn    = btnGroup.add("button", undefined, "Run",    { name: "ok" });
+    var closeBtn = btnGroup.add("button", undefined, "Close", { name: "cancel" });
+    var runBtn   = btnGroup.add("button", undefined, "Copy",  { name: "ok" });
 
-    cancelBtn.onClick = function () { dlg.close(); };
+    closeBtn.onClick = function () { dlg.close(); };
 
-    runBtn.onClick = function () {
-      if (!dropdown.selection) { alert("Please select a layer."); return; }
-      var layerName  = dropdown.selection.text;
+    // Copy one layer name into the current scope; returns a short status string
+    function copyOneLayer(layerName) {
       var totalCount = 0;
       var skipped    = 0;
+      var replaced   = 0;
+      var replaceExisting = replaceCb.value;
 
       if (scope === "current") {
-        // ── This document ──
         for (var i = 0; i < selectedArtboards.length; i++) {
           var ab    = selectedArtboards[i];
           var layer = findLayerRecursive(ab, layerName);
           if (!layer) { skipped++; continue; }
-          var result = copyLayerToMatchingArtboards(layer, ab, allArtboards);
+          var result = copyLayerToMatchingArtboards(layer, ab, allArtboards, replaceExisting);
           totalCount += result.count;
+          replaced   += result.replaced;
         }
-        dlg.close();
-        var msg = "Done! Copied \"" + layerName + "\" to " + totalCount + " artboard" + (totalCount !== 1 ? "s" : "") + ".";
-        if (skipped > 0) msg += "\n(" + skipped + " artboard" + (skipped !== 1 ? "s" : "") + " did not contain that layer and were skipped.)";
-        alert(msg);
+        var msg = "Copied \"" + layerName + "\" to " + totalCount + " artboard" + (totalCount !== 1 ? "s" : "") + ".";
+        if (replaced > 0) msg += " Replaced " + replaced + ".";
+        if (skipped > 0) msg += " (" + skipped + " skipped)";
+        return msg;
 
       } else if (scope === "open") {
-        // ── All open documents ──
         var docErrors = 0;
         for (var d = 0; d < app.documents.length; d++) {
           var targetDoc = app.documents[d];
           if (targetDoc.id === doc.id) continue;
           try {
-            var r = copyLayersToDocument(selectedArtboards, layerName, targetDoc);
+            var r = copyLayersToDocument(selectedArtboards, layerName, targetDoc, replaceExisting);
             totalCount += r.count;
             skipped    += r.skipped;
+            replaced   += r.replaced;
           } catch (e) { docErrors++; }
         }
-        dlg.close();
-        var msg = "Done! Copied \"" + layerName + "\" to " + totalCount + " artboard" + (totalCount !== 1 ? "s" : "") + " across open documents.";
-        if (skipped > 0) msg += "\n(" + skipped + " artboard" + (skipped !== 1 ? "s" : "") + " skipped \u2014 layer not found.)";
-        if (docErrors > 0) msg += "\n(" + docErrors + " error" + (docErrors !== 1 ? "s" : "") + " encountered.)";
-        alert(msg);
+        var msg = "Copied \"" + layerName + "\" to " + totalCount + " artboard" + (totalCount !== 1 ? "s" : "") + " across open docs.";
+        if (replaced > 0) msg += " Replaced " + replaced + ".";
+        if (skipped > 0) msg += " (" + skipped + " skipped)";
+        if (docErrors > 0) msg += " (" + docErrors + " error" + (docErrors !== 1 ? "s" : "") + ")";
+        return msg;
 
       } else {
-        // ── Folder ──
-        var psdFiles   = getPSDFiles(scope);
-        var filesDone  = 0;
+        // Folder
+        var psdFiles    = getPSDFiles(scope);
+        var filesDone   = 0;
         var failedNames = [];
         if (psdFiles.length === 0) {
-          dlg.close();
-          alert("No PSD or PSB files found in the selected folder.");
-          return;
+          return "No PSD or PSB files found in the selected folder.";
         }
         var sourceFilePath = (doc.fullName) ? doc.fullName.fsName : null;
         var prevDialogs = app.displayDialogs;
         app.displayDialogs = DialogModes.NO;
         for (var f = 0; f < psdFiles.length; f++) {
-          // Skip the source document itself
           if (sourceFilePath && psdFiles[f].fsName === sourceFilePath) continue;
           var targetDoc = null;
           try {
             targetDoc = app.open(psdFiles[f]);
-            var r = copyLayersToDocument(selectedArtboards, layerName, targetDoc);
+            var r = copyLayersToDocument(selectedArtboards, layerName, targetDoc, replaceExisting);
             totalCount += r.count;
             skipped    += r.skipped;
+            replaced   += r.replaced;
             targetDoc.close(SaveOptions.SAVECHANGES);
             filesDone++;
           } catch (e) {
-            failedNames.push(psdFiles[f].name + " (" + e.message + ")");
+            failedNames.push(psdFiles[f].name);
             if (targetDoc) {
               try { targetDoc.close(SaveOptions.DONOTSAVECHANGES); } catch (e2) {}
             }
           }
         }
         app.displayDialogs = prevDialogs;
-        dlg.close();
-        var msg = "Done! Processed " + filesDone + " of " + psdFiles.length + " file" + (psdFiles.length !== 1 ? "s" : "") + ".";
-        msg += "\nCopied \"" + layerName + "\" to " + totalCount + " artboard" + (totalCount !== 1 ? "s" : "") + " total.";
-        if (skipped > 0) msg += "\n(" + skipped + " artboard" + (skipped !== 1 ? "s" : "") + " skipped \u2014 layer not found.)";
-        if (failedNames.length > 0) msg += "\n\nFailed files:\n" + failedNames.join("\n");
-        alert(msg);
+        var msg = "\"" + layerName + "\": " + filesDone + "/" + psdFiles.length + " files, " + totalCount + " artboard" + (totalCount !== 1 ? "s" : "") + ".";
+        if (replaced > 0) msg += " Replaced " + replaced + ".";
+        if (skipped > 0) msg += " (" + skipped + " skipped)";
+        if (failedNames.length > 0) msg += " Failed: " + failedNames.join(", ");
+        return msg;
       }
+    }
+
+    runBtn.onClick = function () {
+      var names = getSelectedLayerNames();
+      if (names.length === 0) {
+        statusText.text = "Please select at least one layer.";
+        return;
+      }
+
+      runBtn.enabled = false;
+      closeBtn.enabled = false;
+      statusText.text = "Working\u2026";
+      dlg.update();
+
+      var summaries = [];
+      for (var n = 0; n < names.length; n++) {
+        statusText.text = "Copying " + (n + 1) + " of " + names.length + ": " + names[n] + "\u2026";
+        dlg.update();
+        summaries.push(copyOneLayer(names[n]));
+      }
+
+      // Keep dialog open so another selection can be copied immediately
+      if (names.length === 1) {
+        statusText.text = summaries[0];
+      } else {
+        statusText.text = "Done — copied " + names.length + " layers. Select more or Close.";
+        // Full breakdown in a single alert so details aren't lost
+        alert(summaries.join("\n"));
+      }
+
+      runBtn.enabled = true;
+      closeBtn.enabled = true;
+      app.activeDocument = doc;
     };
 
     dlg.show();
@@ -600,7 +761,7 @@
     var sourceArtboard = getParentArtboard(sourceLayer);
     if (!sourceArtboard) { alert("Selected layer must be inside an artboard."); return; }
 
-    var result = copyLayerToMatchingArtboards(sourceLayer, sourceArtboard, allArtboards);
+    var result = copyLayerToMatchingArtboards(sourceLayer, sourceArtboard, allArtboards, false);
     if (result.error) { alert(result.error); return; }
 
     var rect   = getArtboardRect(sourceArtboard);
