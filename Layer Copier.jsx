@@ -106,71 +106,78 @@
   }
 
   // Find a layer by name recursively
-  function findLayerRecursive(layerSet, name) {
+  function findLayerRecursive(layerSet, name, excludeId) {
     for (var i = 0; i < layerSet.layers.length; i++) {
       var l = layerSet.layers[i];
-      if (l.name === name) return l;
+      if (l.name === name && l.id !== excludeId) return l;
       if (l.typename === "LayerSet") {
-        var found = findLayerRecursive(l, name);
+        var found = findLayerRecursive(l, name, excludeId);
         if (found) return found;
       }
     }
     return null;
   }
 
-  // If a same-named layer exists in the artboard, remove it and return where
-  // the replacement should be inserted (same parent / stack position when possible).
-  // Returns { removed: bool, container: LayerSet|Artboard, relative: Layer|null, placement: ElementPlacement }
-  function prepareReplaceSlot(artboard, layerName) {
-    var existing = findLayerRecursive(artboard, layerName);
+  function findLayerByIdRecursive(container, layerId) {
+    for (var i = 0; i < container.layers.length; i++) {
+      var layer = container.layers[i];
+      if (layer.id === layerId) return layer;
+      if (layer.typename === "LayerSet") {
+        var found = findLayerByIdRecursive(layer, layerId);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  function removeLayerById(layerId) {
+    var ref = new ActionReference();
+    ref.putIdentifier(charIDToTypeID("Lyr "), layerId);
+    var desc = new ActionDescriptor();
+    desc.putReference(charIDToTypeID("null"), ref);
+    executeAction(charIDToTypeID("Dlt "), desc, DialogModes.NO);
+  }
+
+  // If a same-named layer exists, keep it alive as the insertion reference.
+  // Deleting first can invalidate sibling DOM objects in Photoshop. Callers insert
+  // the replacement before this layer, then delete the old layer by its stable ID.
+  function prepareReplaceSlot(artboard, layerName, excludeId) {
+    var existing = findLayerRecursive(artboard, layerName, excludeId);
     if (!existing) {
       return {
-        removed: false,
+        existingId: null,
         container: artboard,
         relative: null,
         placement: ElementPlacement.PLACEATBEGINNING
       };
     }
 
-    var parent = existing.parent;
-    var siblings = parent.layers;
-    var idx = -1;
-    for (var i = 0; i < siblings.length; i++) {
-      if (siblings[i].id === existing.id) { idx = i; break; }
-    }
-
-    // Layer below the existing one (higher index = lower in the stack)
-    var below = (idx >= 0 && idx + 1 < siblings.length) ? siblings[idx + 1] : null;
-    existing.remove();
-
-    if (below) {
-      return {
-        removed: true,
-        container: parent,
-        relative: below,
-        placement: ElementPlacement.PLACEBEFORE
-      };
-    }
     return {
-      removed: true,
-      container: parent,
-      relative: null,
-      placement: ElementPlacement.PLACEATBEGINNING
+      existingId: existing.id,
+      container: existing.parent,
+      relative: existing,
+      placement: ElementPlacement.PLACEBEFORE
     };
   }
 
   function duplicateIntoSlot(sourceLayer, artboard, layerName, replaceExisting) {
     if (replaceExisting) {
       var slot = prepareReplaceSlot(artboard, layerName);
+      var duplicated;
       if (slot.relative) {
-        return {
-          layer: sourceLayer.duplicate(slot.relative, slot.placement),
-          replaced: slot.removed
-        };
+        duplicated = sourceLayer.duplicate(slot.relative, slot.placement);
+      } else {
+        duplicated = sourceLayer.duplicate(slot.container, slot.placement);
+      }
+      if (slot.existingId !== null) {
+        var duplicatedId = duplicated.id;
+        removeLayerById(slot.existingId);
+        duplicated = findLayerByIdRecursive(app.activeDocument, duplicatedId);
+        if (!duplicated) throw new Error("Could not reacquire replacement layer.");
       }
       return {
-        layer: sourceLayer.duplicate(slot.container, slot.placement),
-        replaced: slot.removed
+        layer: duplicated,
+        replaced: slot.existingId !== null
       };
     }
     return {
@@ -230,6 +237,56 @@
     return result;
   }
 
+  function getLayerSectionExpanded(layerId) {
+    try {
+      var property = stringIDToTypeID("layerSectionExpanded");
+      var ref = new ActionReference();
+      ref.putProperty(stringIDToTypeID("property"), property);
+      ref.putIdentifier(stringIDToTypeID("layer"), layerId);
+      return executeActionGet(ref).getBoolean(property);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function setLayerSectionExpanded(layerId, expanded) {
+    try {
+      var ref = new ActionReference();
+      ref.putProperty(
+        stringIDToTypeID("property"),
+        stringIDToTypeID("layerSectionExpanded")
+      );
+      ref.putIdentifier(stringIDToTypeID("layer"), layerId);
+
+      var desc = new ActionDescriptor();
+      desc.putReference(stringIDToTypeID("null"), ref);
+      desc.putBoolean(stringIDToTypeID("to"), expanded);
+      executeAction(stringIDToTypeID("set"), desc, DialogModes.NO);
+    } catch (e) {}
+  }
+
+  function captureLayerSectionStates(container, states) {
+    states = states || [];
+    for (var i = 0; i < container.layers.length; i++) {
+      var layer = container.layers[i];
+      if (layer.typename !== "LayerSet") continue;
+
+      var expanded = getLayerSectionExpanded(layer.id);
+      if (expanded !== null) {
+        states.push({ id: layer.id, expanded: expanded });
+      }
+      captureLayerSectionStates(layer, states);
+    }
+    return states;
+  }
+
+  function restoreLayerSectionStates(targetDoc, states) {
+    app.activeDocument = targetDoc;
+    for (var i = 0; i < states.length; i++) {
+      setLayerSectionExpanded(states[i].id, states[i].expanded);
+    }
+  }
+
   // ─── Cross-Document Copy ──────────────────────────────────────────────────
 
   // Copies the named layer from every selected source artboard into matching-size
@@ -238,21 +295,27 @@
   // so they remain linked to each other inside the target document.
   function moveIntoSlot(layer, artboard, layerName, replaceExisting) {
     if (replaceExisting) {
-      var slot = prepareReplaceSlot(artboard, layerName);
+      // A cross-document duplicate can initially land inside this artboard.
+      // Exclude the incoming layer so it is not mistaken for the old copy.
+      var slot = prepareReplaceSlot(artboard, layerName, layer.id);
       if (slot.relative) {
         layer.move(slot.relative, slot.placement);
       } else {
         layer.move(slot.container, slot.placement);
       }
-      return slot.removed;
+      return {
+        layer: layer,
+        replacedId: slot.existingId
+      };
     }
     layer.move(artboard, ElementPlacement.PLACEATBEGINNING);
-    return false;
+    return { layer: layer, replacedId: null };
   }
 
   function copyLayersToDocument(selectedArtboards, layerName, targetDoc, replaceExisting) {
     // Gather all target artboards while targetDoc is active
     app.activeDocument = targetDoc;
+    var targetSectionStates = captureLayerSectionStates(targetDoc);
     var targetArtboards = getAllArtboards(targetDoc);
 
     // Build source candidates first; then map exactly one candidate per target artboard.
@@ -261,6 +324,7 @@
     var placements       = [];
     var skipped          = 0;
     var replaced         = 0;
+    var replacementIds   = [];
 
     for (var i = 0; i < selectedArtboards.length; i++) {
       app.activeDocument = doc;
@@ -315,7 +379,7 @@
 
       placements.push({
         sourceLayer: chosen.sourceLayer,
-        targetArtboard: targetAb,
+        targetArtboardId: targetAb.id,
         rect: rect,
         relX: chosen.relX,
         relY: chosen.relY,
@@ -332,7 +396,15 @@
 
     // Place the base layer in the first target artboard (replace same-named layer if opted in)
     app.activeDocument = targetDoc;
-    if (moveIntoSlot(baseLayer, placements[0].targetArtboard, layerName, replaceExisting)) replaced++;
+    var firstTargetArtboard = findLayerByIdRecursive(targetDoc, placements[0].targetArtboardId);
+    if (!firstTargetArtboard) throw new Error("Could not reacquire first target artboard.");
+    var movedBase = moveIntoSlot(baseLayer, firstTargetArtboard, layerName, replaceExisting);
+    baseLayer = movedBase.layer;
+    if (movedBase.replacedId !== null) {
+      replacementIds.push(movedBase.replacedId);
+      replaced++;
+    }
+    var baseLayerId = baseLayer.id;
     var bb = getLayerTransformBounds(baseLayer);
     var baseW = bb[2].value - bb[0].value;
     var baseH = bb[3].value - bb[1].value;
@@ -355,14 +427,21 @@
     // artboard sizes get the correct scale while still sharing one embedded smart object.
     for (var p = 1; p < placements.length; p++) {
       app.activeDocument = targetDoc;
+      baseLayer = findLayerByIdRecursive(targetDoc, baseLayerId);
+      if (!baseLayer) throw new Error("Could not reacquire base layer.");
+      var targetArtboard = findLayerByIdRecursive(targetDoc, placements[p].targetArtboardId);
+      if (!targetArtboard) throw new Error("Could not reacquire target artboard.");
       var slot = replaceExisting
-        ? prepareReplaceSlot(placements[p].targetArtboard, layerName)
-        : { removed: false, container: placements[p].targetArtboard, relative: null, placement: ElementPlacement.PLACEATBEGINNING };
-      if (slot.removed) replaced++;
+        ? prepareReplaceSlot(targetArtboard, layerName)
+        : { existingId: null, container: targetArtboard, relative: null, placement: ElementPlacement.PLACEATBEGINNING };
 
       var duped = slot.relative
         ? baseLayer.duplicate(slot.relative, slot.placement)
         : baseLayer.duplicate(slot.container, slot.placement);
+      if (slot.existingId !== null) {
+        replacementIds.push(slot.existingId);
+        replaced++;
+      }
 
       var db = getLayerTransformBounds(duped);
       duped.translate(
@@ -382,6 +461,14 @@
       copyLayerEffectsBetweenDocuments(placements[p].sourceLayer, duped, targetDoc);
     }
 
+    // Deleting layers invalidates Photoshop DOM objects in some builds. Wait until
+    // all copies are fully positioned and styled, then remove the old layers by ID.
+    app.activeDocument = targetDoc;
+    for (var oldIndex = 0; oldIndex < replacementIds.length; oldIndex++) {
+      removeLayerById(replacementIds[oldIndex]);
+    }
+    restoreLayerSectionStates(targetDoc, targetSectionStates);
+
     return { count: placements.length, skipped: skipped, replaced: replaced };
   }
 
@@ -397,6 +484,17 @@
       }
     }
     return result;
+  }
+
+  function formatError(error) {
+    var details = [];
+    if (error.number !== undefined) details.push("error " + error.number);
+    if (error.line !== undefined) details.push("line " + error.line);
+
+    var message = error.message || error.description || error.toString();
+    if (message) details.push(message);
+
+    return details.join(", ");
   }
 
   // ─── Scope Dialog ─────────────────────────────────────────────────────────
@@ -673,6 +771,7 @@
         var psdFiles    = getPSDFiles(scope);
         var filesDone   = 0;
         var failedNames = [];
+        var failedDetails = [];
         if (psdFiles.length === 0) {
           return "No PSD or PSB files found in the selected folder.";
         }
@@ -682,16 +781,22 @@
         for (var f = 0; f < psdFiles.length; f++) {
           if (sourceFilePath && psdFiles[f].fsName === sourceFilePath) continue;
           var targetDoc = null;
+          var phase = "opening file";
           try {
             targetDoc = app.open(psdFiles[f]);
+            phase = "copying layer";
             var r = copyLayersToDocument(selectedArtboards, layerName, targetDoc, replaceExisting);
             totalCount += r.count;
             skipped    += r.skipped;
             replaced   += r.replaced;
+            phase = "saving file";
             targetDoc.close(SaveOptions.SAVECHANGES);
             filesDone++;
           } catch (e) {
             failedNames.push(psdFiles[f].name);
+            failedDetails.push(
+              psdFiles[f].name + " (" + phase + "): " + formatError(e)
+            );
             if (targetDoc) {
               try { targetDoc.close(SaveOptions.DONOTSAVECHANGES); } catch (e2) {}
             }
@@ -702,6 +807,9 @@
         if (replaced > 0) msg += " Replaced " + replaced + ".";
         if (skipped > 0) msg += " (" + skipped + " skipped)";
         if (failedNames.length > 0) msg += " Failed: " + failedNames.join(", ");
+        if (failedDetails.length > 0) {
+          alert("Photoshop reported:\n\n" + failedDetails.join("\n\n"));
+        }
         return msg;
       }
     }
@@ -719,11 +827,14 @@
       dlg.update();
 
       var summaries = [];
+      app.activeDocument = doc;
+      var sourceSectionStates = captureLayerSectionStates(doc);
       for (var n = 0; n < names.length; n++) {
         statusText.text = "Copying " + (n + 1) + " of " + names.length + ": " + names[n] + "\u2026";
         dlg.update();
         summaries.push(copyOneLayer(names[n]));
       }
+      restoreLayerSectionStates(doc, sourceSectionStates);
 
       // Keep dialog open so another selection can be copied immediately
       if (names.length === 1) {
